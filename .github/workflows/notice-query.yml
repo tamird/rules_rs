@@ -1,0 +1,92 @@
+name: Legacy notice queries
+on:
+  push:
+    branches: [qualify/rust-notice-query]
+permissions:
+  contents: read
+jobs:
+  consumer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: supplier
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Consumer with actual old and current releases
+        run: |
+          mkdir consumer evidence
+          cd consumer
+          echo 9.0.0 > .bazelversion
+          cat > MODULE.bazel <<'EOF'
+          module(name = "query_notice")
+          bazel_dep(name = "rules_rs", version = "0.0.0")
+          local_path_override(module_name = "rules_rs", path = "../supplier")
+          bazel_dep(name = "rules_pkg", version = "1.2.0")
+          rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+          use_repo(rules_rust, "rules_rust")
+          tc = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+          tc.toolchain(version = "1.85.0")
+          tc.toolchain(name = "current", version = "1.99.1")
+          use_repo(tc, "default_rust_toolchains", "current")
+          register_toolchains("@default_rust_toolchains//...")
+          EOF
+          cat > BUILD.bazel <<'EOF'
+          load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+          load(":selected.bzl", "selected")
+          selected(name = "rustc")
+          pkg_tar(name = "old", srcs = ["@default_rust_toolchains//:library_notice"])
+          pkg_tar(name = "current", srcs = ["@current//:library_notice"])
+          EOF
+          cat > selected.bzl <<'EOF'
+          def _selected_impl(ctx):
+              return [DefaultInfo(files = depset([ctx.toolchains["@rules_rust//rust:toolchain_type"].rustc]))]
+          selected = rule(implementation = _selected_impl, toolchains = ["@rules_rust//rust:toolchain_type"])
+          EOF
+      - name: Prior proposal makes legacy dependency queries fail
+        working-directory: consumer
+        run: |
+          set -euo pipefail
+          git -C ../supplier checkout --detach d88ac68c4
+          if bazel query 'deps(@default_rust_toolchains//:library_notice)' > ../evidence/before.log 2>&1; then exit 1; fi
+          grep -F 'no such target' ../evidence/before.log | grep -F COPYRIGHT-library.html
+      - name: Candidate permits queries and normal old-version wildcard registration
+        working-directory: consumer
+        run: |
+          set -euo pipefail
+          git -C ../supplier checkout --detach bfb86e3e7
+          bazel query 'deps(@default_rust_toolchains//:library_notice)' | tee ../evidence/alias.log
+          grep -F COPYRIGHT-library.html ../evidence/alias.log
+          bazel query 'deps(@default_rust_toolchains//...)' > ../evidence/wildcard.log
+          bazel build //:rustc
+          path=$(bazel cquery --output=files //:rustc | grep '/bin/rustc$')
+          root=$(bazel info execution_root)
+          "$root/$path" --version | tee ../evidence/compiler.log
+          grep '^rustc 1\.85\.0 ' ../evidence/compiler.log
+      - name: Direct build and packaging must both report the absent input
+        if: always()
+        working-directory: consumer
+        run: |
+          set -euo pipefail
+          git -C ../supplier checkout --detach bfb86e3e7
+          for target in '@default_rust_toolchains//:library_notice' '//:old'; do
+            logfile=../evidence/absent-$(basename "$target" | tr -dc 'a-z_').log
+            if bazel build "$target" > "$logfile" 2>&1; then cat "$logfile"; exit 1; fi
+            grep -iE 'missing.*COPYRIGHT-library.html|COPYRIGHT-library.html.*(missing|not exist)' "$logfile" || { tail -25 "$logfile"; exit 1; }
+          done
+      - name: Positive artifact must retain previously verified release bytes
+        if: always()
+        working-directory: consumer
+        run: |
+          set -euo pipefail
+          git -C ../supplier checkout --detach bfb86e3e7
+          bazel build //:current
+          member=$(tar -tf bazel-bin/current.tar | grep -E '(^|/)COPYRIGHT-library.html$')
+          tar -Ox -f bazel-bin/current.tar "$member" | sha256sum | tee ../evidence/current.log
+          grep -F 5647be074c8edf7339fd863055923a8fc80bc5610a8d4661ec3b767b9d392c27 ../evidence/current.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: legacy-query
+          path: evidence/*.log
