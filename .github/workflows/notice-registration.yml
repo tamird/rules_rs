@@ -1,0 +1,60 @@
+name: Rust notice registration
+on:
+  push:
+    branches: [qualify/rust-notice-registration]
+permissions:
+  contents: read
+jobs:
+  registration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: supplier
+          ref: d88ac68c498b32d4fe7de57802bb5c1d11a34068
+          persist-credentials: false
+      - name: Resolve the pre-1.86 Rust compiler through normal wildcard registration
+        run: |
+          set -euo pipefail
+          mkdir consumer
+          cd consumer
+          echo 9.0.0 > .bazelversion
+          cat > MODULE.bazel <<'EOF'
+          module(name = "old_rust_consumer")
+          bazel_dep(name = "rules_rs", version = "0.0.0")
+          local_path_override(module_name = "rules_rs", path = "../supplier")
+          rules_rust = use_extension("@rules_rs//rs:rules_rust.bzl", "rules_rust")
+          use_repo(rules_rust, "rules_rust")
+          toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+          toolchains.toolchain(version = "1.85.0")
+          use_repo(toolchains, "default_rust_toolchains")
+          register_toolchains("@default_rust_toolchains//...")
+          EOF
+          cat > selected.bzl <<'EOF'
+          def _selected_impl(ctx):
+              return [DefaultInfo(files = depset([ctx.toolchains["@rules_rust//rust:toolchain_type"].rustc]))]
+          selected = rule(implementation = _selected_impl, toolchains = ["@rules_rust//rust:toolchain_type"])
+          EOF
+          printf '%s\n' 'load(":selected.bzl", "selected")' 'selected(name = "rustc")' > BUILD.bazel
+          bazel build //:rustc
+          path=$(bazel cquery --output=files //:rustc | grep '/bin/rustc$')
+          root=$(bazel info execution_root)
+          "$root/$path" --version | tee /tmp/selected-rustc.txt
+          grep '^rustc 1\.85\.0 ' /tmp/selected-rustc.txt
+      - name: Check the changed Starlark files with supplier-pinned Buildifier
+        if: always()
+        working-directory: supplier
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 2 https://github.com/bazelbuild/buildtools/releases/download/v7.3.1/buildifier-linux-amd64 -o /tmp/rules-rs-buildifier
+          chmod +x /tmp/rules-rs-buildifier
+          /tmp/rules-rs-buildifier -mode=check rs/private/rustc_repository.bzl rs/private/toolchains_repository.bzl rs/toolchains/module_extension.bzl test/BUILD.bazel
+      - name: Run the permanent upstream test through its normal entry point
+        if: always()
+        working-directory: supplier/test
+        run: |
+          set -euo pipefail
+          git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global --add url."https://github.com/".insteadOf "git@github.com:"
+          bazel --ignore_all_rc_files test --incompatible_disallow_empty_glob=False --test_output=errors //:library_notice_test
