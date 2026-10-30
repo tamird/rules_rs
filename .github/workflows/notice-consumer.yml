@@ -1,0 +1,99 @@
+name: Rust notice consumer
+on:
+  push:
+    branches: [qualify/rust-library-notice]
+permissions:
+  contents: read
+jobs:
+  consumer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: supplier
+          fetch-depth: 0
+          persist-credentials: false
+      - name: External MODULE and packaging targets
+        run: |
+          set -euo pipefail
+          mkdir consumer evidence
+          cd consumer
+          echo 9.0.0 > .bazelversion
+          cat > MODULE.bazel <<'EOF'
+          module(name = "notice_consumer")
+          bazel_dep(name = "rules_rs", version = "0.0.0")
+          local_path_override(module_name = "rules_rs", path = "../supplier")
+          bazel_dep(name = "rules_pkg", version = "1.2.0")
+          toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "toolchains")
+          toolchains.toolchain(version = "1.99.1")
+          toolchains.toolchain(name = "previous", version = "1.96.1")
+          toolchains.toolchain(name = "legacy", version = "1.85.0")
+          use_repo(toolchains, "default_rust_toolchains", "previous", "legacy", "rustc_linux_x86_64_1_85_0")
+          EOF
+          cat > BUILD.bazel <<'EOF'
+          load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
+          pkg_tar(name = "current", srcs = ["@default_rust_toolchains//:library_notice"])
+          pkg_tar(name = "previous", srcs = ["@previous//:library_notice"])
+          pkg_tar(name = "legacy", srcs = ["@legacy//:library_notice"])
+          filegroup(name = "legacy_rustc", srcs = ["@rustc_linux_x86_64_1_85_0//:rustc"])
+          EOF
+      - name: Original public label is missing
+        working-directory: consumer
+        run: |
+          set -euo pipefail
+          git -C ../supplier checkout --detach 99e2e1126
+          if bazel build //:current > ../evidence/stock.txt 2>&1; then exit 1; fi
+          grep -E '(no such package|no such target|BUILD file not found|no.*BUILD file).*default_rust_toolchains|default_rust_toolchains.*BUILD file' ../evidence/stock.txt || { tail -45 ../evidence/stock.txt; exit 1; }
+      - name: Package two selected Rust releases on two target platforms
+        working-directory: consumer
+        run: |
+          set -euo pipefail
+          git -C ../supplier checkout --detach d88ac68c4
+          for arch in x86_64 aarch64; do
+            bazel build --platforms="@rules_rs//rs/platforms:${arch}-unknown-linux-gnu" //:current //:previous
+            for name in current previous; do
+              file=bazel-bin/$name.tar
+              member=$(tar -tf "$file" | grep -E '(^|/)COPYRIGHT-library.html$')
+              tar -xf "$file" "$member" -O > "../evidence/$name.$arch.html"
+              test -s "../evidence/$name.$arch.html"
+            done
+          done
+          cmp ../evidence/current.x86_64.html ../evidence/current.aarch64.html
+          cmp ../evidence/previous.x86_64.html ../evidence/previous.aarch64.html
+          ! cmp -s ../evidence/current.x86_64.html ../evidence/previous.x86_64.html
+      - name: Older compiler remains usable and requesting its absent notice fails
+        working-directory: consumer
+        run: |
+          set -euo pipefail
+          bazel build //:legacy_rustc
+          if bazel build //:legacy > ../evidence/legacy.txt 2>&1; then exit 1; fi
+          grep -E '(no such target|missing input file).*COPYRIGHT-library.html|COPYRIGHT-library.html.*(not declared|does not exist)' ../evidence/legacy.txt || { tail -45 ../evidence/legacy.txt; exit 1; }
+      - name: Compare output to independently verified host release archives
+        run: |
+          set -euo pipefail
+          cd evidence
+          for pair in current:1.99.1 previous:1.96.1; do
+            name=${pair%:*}
+            version=${pair#*:}
+            url=https://github.com/hermeticbuild/rust-redist/releases/download/$version
+            curl --fail --silent --show-error --location --retry 2 "$url/manifest.json" -o "$name.manifest"
+            for triple in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+              stem=rustc-$version-$triple
+              file=$stem.tar.zst
+              curl --fail --silent --show-error --location --retry 2 "$url/$file" -o "$file"
+              printf '%s  %s\n' "$(jq -er --arg path "$file" '.archives[$path].sha256' "$name.manifest")" "$file" | sha256sum -c -
+              tar -xOf "$file" "$stem/rustc/share/doc/rust/COPYRIGHT-library.html" > "$name.$triple.html"
+              cmp "$name.x86_64.html" "$name.$triple.html"
+              rm -- "$file"
+            done
+          done
+          sha256sum *.html | tee hashes.txt
+          wc -c *.html | tee sizes.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: consumer-evidence
+          path: |
+            evidence/*.txt
+            evidence/*.manifest
